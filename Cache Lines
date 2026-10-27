@@ -1,0 +1,30 @@
+1. A cache line is the smallest block of memory that a CPU cache typically transfers between RAM and the cache (or between cache levels).
+2. When the CPU needs one piece of data from memory, it usually fetches the entire cache line containing that data.
+3. How does a cache line work?
+Suppose your Java program accesses an integer stored in memory.
+Example: A common cache line size is 64 bytes.
+int A (4 bytes) | int B (4 bytes) | int C (4 bytes) | int D (4 bytes) | int E (4 bytes) | int F (4 bytes) | int G (4 bytes) | int H (4 bytes) = 32 bytes total
+8 integers × 4 bytes = 32 bytes. A 64-byte cache line can hold 16 such integers, assuming contiguous storage and suitable alignment. 
+Here's what happens:
+1. The CPU requests data for int A.
+2. If the required data isn't already in cache, the CPU fetches the cache line containing it.
+3. Nearby data may come into the cache along with int A.
+4. If the CPU accesses nearby data soon afterward, it may find it already cached, making access faster.
+This is why accessing data sequentially is often more cache-friendly than jumping randomly through memory.
+
+4. Connection to cache coherency and volatile
+This is particularly important for multithreaded programming.
+
+Suppose two CPU cores update different variables:
+- Core 1 updates x.
+- Core 2 updates y.
+Even if x and y are logically independent, they might occupy the same cache line.
+
+When one core modifies data in that line, the CPU's cache-coherence protocol may need to invalidate or update the corresponding line in another core's cache. This can cause unnecessary performance overhead.
+
+This problem is called false sharing.
+
+One important distinction:
+- Cache line: a unit of memory transfer and cache-coherence management.
+- Cache coherency: mechanisms that keep cached copies consistent across CPU cores.
+- volatile in Java: provides visibility and ordering guarantees for accesses to a variable; it does not eliminate false sharing.
