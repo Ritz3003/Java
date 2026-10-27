@@ -28,3 +28,50 @@ One important distinction:
 - Cache line: a unit of memory transfer and cache-coherence management.
 - Cache coherency: mechanisms that keep cached copies consistent across CPU cores.
 - volatile in Java: provides visibility and ordering guarantees for accesses to a variable; it does not eliminate false sharing.
+
+The main solution to false sharing is to ensure that variables frequently modified by different CPU cores do not share the same cache line.
+Solutions to false sharing
+
+Solution 1: Padding
+
+Add unused fields between frequently modified variables to increase the chance that they occupy different cache lines.
+
+Example :
+
+class PaddedCounters {
+    volatile long counter1;
+    long p1, p2, p3, p4, p5, p6, p7;
+
+    volatile long counter2;
+}
+
+Limitation: This is not a reliable guarantee. JVM object layout, field reordering, alignment, and actual cache-line size matter.
+
+Solution 2: Use @Contended
+
+Java provides an annotation designed to separate contended fields or objects in memory.
+import jdk.internal.vm.annotation.Contended;
+
+class Counters {
+    @Contended
+    volatile long counter1;
+
+    @Contended
+    volatile long counter2;
+}
+Limitation: This annotation is an internal JDK API, and its use may require JVM options such as -XX:-RestrictContended. Availability and behavior depend on the JDK. It is not a general-purpose portable guarantee.
+
+
+
+
+Solution 3: Use thread-local or per-thread counters
+
+Instead of making multiple threads update shared counters continuously, let each thread update its own counter and aggregate the results later.
+LongAdder counter = new LongAdder();
+
+// Multiple threads
+counter.increment();
+
+// Read the aggregated count
+long total = counter.sum();
+LongAdder reduces contention on heavily updated counters by distributing updates across internal cells. It is often a good choice for high-throughput statistics, though it does not guarantee that false sharing is impossible.
