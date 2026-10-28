@@ -75,3 +75,116 @@ counter.increment();
 // Read the aggregated count
 long total = counter.sum();
 LongAdder reduces contention on heavily updated counters by distributing updates across internal cells. It is often a good choice for high-throughput statistics, though it does not guarantee that false sharing is impossible.
+
+
+Let's understand MESI protocol step by step. It's useful for Java backend interviews when discussing CPU caches, multithreading, and false sharing.
+1. Why do we need cache coherence?
+Suppose two CPU cores have cached the same memory location.
+	•	Core 1 reads counter = 10.  
+	•	Core 2 also reads counter = 10.  
+	•	Core 1 changes it to 11.  
+Now Core 2's cached copy is stale. The CPU needs a mechanism to keep cached data consistent.
+MESI is a cache-coherence protocol that uses four states to track a cache line.
+2. The four MESI states
+M
+Modified
+Modified
+This core has changed the cache line. Its copy is dirty, and main memory may have an older value.
+
+E
+Exclusive
+Exclusive
+This core has the only cached copy, and it is clean (consistent with memory).
+
+S
+Shared
+Shared
+Multiple cores can hold clean copies of the cache line.
+
+I
+Invalid
+Invalid
+This cache line is not currently valid for use by this core.
+3. How MESI causes false sharing
+Imagine one 64-byte cache line contains two variables:
+volatile long counter1 = 0;
+volatile long counter2 = 0;
+Core 1 modifies counter1, while Core 2 modifies counter2.
+One shared cache line
+counter1
+Core 1 updates
+counter2
+Core 2 updates
+	1	Core 1 needs exclusive write access to the cache line. 
+	2	The coherence protocol invalidates conflicting cached copies held by other cores. 
+	3	Core 2 then needs write access to update its own variable, so ownership may move to Core 2. 
+	4	If both cores keep writing, the line can repeatedly move between them, hurting performance. 
+Key insight: The CPU manages coherence at the cache-line level, not separately for each Java variable. That's why false sharing can happen.
+4. Interview check
+Suppose Core 1 has a cache line in the Modified (M) state. Core 2 wants to read that same memory location.
+What do you think should happen?
+
+A. Core 2 always reads the stale value directly from RAM.
+
+B. The coherence protocol coordinates access so Core 2 receives the latest value.
+
+C. Core 2 can never read the value until the computer restarts.
+
+
+Interview ka sabse bada trap
+“Hardware to cache coherent hai, phir volatile kyun chahiye?”
+Kyunki coherency ≠ visibility ordering. MESI sirf ye guarantee karta hai ki ek hi address ki copies eventually sync ho jayengi. Par:
+	•	Core likhne se pehle value store buffer mein rakhta hai, cache mein turant nahi jaati.
+	•	CPU aur compiler instructions ko reorder kar sakte hain.
+	•	Value register mein bhi atak sakti hai (JIT optimization).
+
+What is instruction reordering?
+Instruction reordering means the compiler or CPU changes the order in which instructions are executed, while preserving the behavior required by the language and hardware rules.
+Why? Performance optimization. The compiler and CPU try to execute instructions efficiently instead of always following the exact source-code order.
+Consider:
+int a = 0;
+int b = 0;
+
+a = 10;  // Statement 1
+b = 20;  // Statement 2
+The compiler or CPU may arrange these independent operations differently if doing so is safe under the applicable rules.
+Rule: as-if-serial
+Reordering tab tak allowed hai jab tak single thread ka result same rahe. Ye rule multi-thread ko kuch guarantee nahi karta, yahi problem ki jad hai.
+
+Praticale Bug
+int data = 0;
+boolean ready = false;   // volatile nahi hai
+
+// Thread 1                 // Thread 2
+data = 42;                  while (!ready) { }
+ready = true;               System.out.println(data);  // 0 aa sakta hai!
+
+Compiler aur CPU order badal sakte hain jab tak single thread ko fark na pade. Multi-thread mein wahi bug ban jaata hai. 
+
+Three important concepts
+
+Compiler reordering
+The compiler optimizes the generated machine instructions.
+
+CPU reordering
+The processor may execute or complete independent operations in a different order internally.
+
+Visibility
+One thread may not immediately observe another thread's writes without the required synchronization.
+4. How do we control it?
+Java provides mechanisms such as:
+	•	volatile  
+	•	synchronized  
+	•	Locks and other concurrency utilities  
+These establish specific ordering and visibility guarantees. At the hardware level, JVMs may use memory barriers or fences when necessary.
+int a = 0;
+int b = 0;
+
+a = 10;
+b = a + 5;
+
+Here, b depends on the value written to a. An optimization cannot simply execute b = a + 5 first if that would change the program's required single-threaded behavior.
+This gives us the first rule:
+An optimization must preserve the required program behavior. Dependencies constrain reordering.
+Multithreading introduces a further complication: the Java Memory Model defines which observations are legal when multiple threads access shared state.
+
