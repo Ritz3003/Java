@@ -188,3 +188,322 @@ This gives us the first rule:
 An optimization must preserve the required program behavior. Dependencies constrain reordering.
 Multithreading introduces a further complication: the Java Memory Model defines which observations are legal when multiple threads access shared state.
 
+Why two threads can observe a surprising result
+Study this classic example:
+class ReorderingExample {
+    static int x = 0;
+    static int y = 0;
+
+    static void writer() {
+        x = 1;
+        y = 1;
+    }
+
+    static void reader() {
+        int r1 = y;
+        int r2 = x;
+    }
+}
+
+
+Assume writer() and reader() run concurrently on different threads, with no synchronization, and each thread runs its method once.
+
+The reader could observe the following combinations:
+r1	r2	Interpretation
+0	0	Neither write was observed
+0	1	The write to x was observed, but not the write to y
+1	1	Both writes were observed
+1	0	The write to y was observed, but not the write to x
+
+The last outcome is the surprising one.
+
+Why might it happen?
+- The compiler or CPU may reorder operations in ways permitted by the memory model.
+- Writes may become observable to other threads at different times.
+- The reader has no synchronization establishing the ordering it expects.
+This example illustrates the difference between program order within a thread and observation order across threads.
+
+It does not mean that every CPU freely reorders every operation. The exact behavior depends on the Java Memory Model, the JVM and the processor architecture.
+
+4. What is a memory barrier (memory fence)?
+A memory barrier is a mechanism that restricts certain memory-operation reorderings and helps establish the required visibility and ordering between threads.
+
+Think of it as a rule saying:
+Certain memory operations before this point must be ordered before certain operations after this point.
+
+A memory barrier isn't necessarily a command that flushes all CPU caches to RAM. Its exact effect depends on the processor and the barrier being used.
+Visual example
+Without a synchronization guarantee:
+Thread A — writer
+data = 100
+
+ready = true
+
+Thread B may not reliably observe the intended relationship between these writes and its reads.
+
+With appropriate ordering and visibility guarantees:
+Thread A — writer
+data = 100
+
+Ordering guarantee
+
+Implemented using Java synchronization semantics
+
+ready = true
+
+Thread B — reader
+Observe ready == true, then read data
+
+If the reader observes the volatile write to ready, it can also observe the preceding write to data.
+
+Here's the Java code that establishes this guarantee:
+class Message {
+    int data;
+    volatile boolean ready;
+
+    void writer() {
+        data = 100;
+        ready = true;
+    }
+
+    void reader() {
+        if (ready) {
+            System.out.println(data); // Guaranteed to see 100
+        }
+    }
+}
+
+
+Why does this work?
+1. The writer stores data = 100.
+2. The writer writes true to the volatile field ready.
+3. The reader reads ready and observes true.
+4. The volatile write synchronizes-with the subsequent volatile read.
+5. The earlier write to data happens-before the reader's access to data.
+Therefore, the reader cannot print the old default value 0 in this scenario. This is a Java Memory Model guarantee, not a claim that all memory operations are physically executed in a particular order.
+
+5. What is the Java Memory Model (JMM)?
+The Java Memory Model defines the rules for how threads interact through shared memory. It specifies which values a read is allowed to observe and what ordering guarantees synchronization provides.
+
+It doesn't mandate one particular CPU architecture or require every write to be immediately sent to RAM.
+
+The key concept is happens-before.
+
+If action A happens-before action B, then A is ordered before B and its effects are visible to B under the JMM rules.
+
+Common happens-before relationships:
+Mechanism	Guarantee
+Program order	Earlier actions in a thread happen-before later actions in that thread.
+volatile	A write to a volatile field happens-before a subsequent read of that field.
+synchronized	Unlocking a monitor happens-before a subsequent lock on the same monitor.
+Thread.start()	Calling start() happens-before actions in the started thread.
+Thread.join()	A thread's actions happen-before another thread successfully returns from joining it.
+
+These rules allow Java developers to reason about concurrency without having to know the exact internal behavior of the CPU. 
+
+Oracle Docs
++1
+
+
+
+6. The difference between reordering, visibility and atomicity
+This distinction is frequently tested in interviews.
+Concept	Question it answers	Example
+Reordering	Can operations be observed in a different order?	A reader observes ready before the expected effects of another write.
+Visibility	Can a thread see another thread's update?	Thread B keeps seeing a stale value.
+Atomicity	Can an operation be interrupted partway through?	Two threads increment a counter and lose an update.
+
+For example:
+volatile int count = 0;
+
+count++;
+
+
+Even with volatile, count++ is not an atomic increment. It involves reading the value, incrementing it, and writing it back. Two threads can both read 0 and both write 1, losing one increment.
+
+Use AtomicInteger.incrementAndGet() or another appropriate concurrency mechanism when atomic increments are required.
+
+1. What is double-checked locking?
+Double-checked locking is a technique used to create a singleton object lazily while avoiding the cost of acquiring a lock on every access.
+- Lazy initialization: Create the object only when it is first needed.
+- Thread safety: Ensure multiple threads don't create separate instances.
+- Performance: After initialization, avoid synchronizing every call. 
+
+2. First, understand the problem
+Suppose you want only one instance of a class.
+
+A naive implementation might be:
+class Singleton {
+    private static Singleton instance;
+
+    public static Singleton getInstance() {
+        if (instance == null) {
+            instance = new Singleton();
+        }
+        return instance;
+    }
+}
+
+
+What happens if two threads call getInstance() at almost the same time?
+Thread A
+instance == null
+true
+Creates object A
+
+
+Thread B
+instance == null
+true
+Creates object B
+
+
+
+Both threads can pass the check and create separate objects. The implementation is not thread-safe.
+
+We could synchronize the whole method:
+public static synchronized Singleton getInstance() {
+    if (instance == null) {
+        instance = new Singleton();
+    }
+    return instance;
+}
+
+
+This is thread-safe, but every call acquires the same monitor, even after the instance exists.
+
+Double-checked locking aims to avoid that repeated synchronization.
+
+How double-checked locking works
+There are two checks for instance == null:
+1. The first check avoids locking when the instance already exists.
+2. The second check, inside the synchronized block, prevents multiple threads from creating the instance simultaneously.
+Call getInstance()
+
+Check 1: Is instance == null?
+
+No
+
+Return existing instance
+
+
+Yes
+
+Acquire lock
+
+
+
+Check 2: Is instance == null inside the lock?
+
+No
+
+Another thread initialized it
+
+
+Yes
+
+Create instance
+
+
+
+Return the instance
+
+4. The correct implementation in Java
+The volatile keyword is essential in the classic double-checked locking pattern.
+public final class Singleton {
+
+    private static volatile Singleton instance;
+
+    private Singleton() {
+    }
+
+    public static Singleton getInstance() {
+        if (instance == null) {                 // Check 1
+            synchronized (Singleton.class) {
+                if (instance == null) {         // Check 2
+                    instance = new Singleton();
+                }
+            }
+        }
+
+        return instance;
+    }
+}
+
+
+Let's understand why each part is needed.
+Code	                                   |    Purpose
+private static volatile Singleton instance |  Provides visibility and the required memory-ordering guarantees.
+First if                                   |	Avoids acquiring the lock after initialization.
+synchronized	                           | Ensures only one thread at a time executes the initialization section.
+Second if	                               | Rechecks the state after acquiring the lock.
+private constructor	                       | Prevents ordinary callers from constructing instances directly.
+
+5. Why is volatile necessary?
+This is the most important interview question about DCL.
+
+Consider this line:
+instance = new Singleton();
+
+
+It looks like one operation in Java source code. Conceptually, creating and assigning an object involves several steps:
+1. Allocate memory for the object.
+2. Initialize the object's fields by running its constructor.
+3. Publish the object's reference in instance.
+Without the necessary memory-ordering guarantees, publication could become visible before initialization is safely observable by another thread.
+
+Declaring the reference volatile ensures that a volatile write to instance happens-before a subsequent volatile read that observes that write. This establishes the necessary visibility and ordering guarantees for the initialized object.
+
+Interview takeaway: synchronized prevents competing initializations, while volatile ensures safe publication and visibility when threads access the instance outside the synchronized block.
+
+### 1. Visibility Guarantee
+
+* **Definition:** Ensures that when one thread updates shared data, another thread is guaranteed to observe that update under relevant synchronization rules.
+* **The Problem:** Without synchronization or `volatile`, changes made by one thread may not be seen by another due to compiler optimizations, CPU caching, or data races (e.g., an infinite loop failing to terminate on a flag change).
+* **Limitation:** Visibility ensures updates are seen, but it is **not** a substitute for synchronization during compound/atomic operations.
+
+---
+
+### 2. What is Happens-Before?
+
+* **Definition:** A formal rule defined by the Java Memory Model (JMM) that establishes ordering and visibility between actions across threads.
+* **Rule:** If Action A **happens-before** Action B, then A is ordered before B under the JMM, and the effects of A are guaranteed to be visible to B.
+* **Key Note:** It is a logical ordering guarantee for concurrent reasoning, not a strict claim about physical real-time execution order.
+
+---
+
+### 3. Happens-Before with `volatile` (Example Breakdown)
+
+* **Setup:** Thread A writes `data = 100`, then writes `ready = true` (volatile). Thread B reads `ready == true`.
+* **Chain of Logic:**
+1. **Program Order:** `data = 100` happens-before `ready = true` inside Thread A.
+2. **Volatile Rule:** Volatile write of `true` synchronizes-with the reader's volatile read.
+3. **Transitivity:** By transitivity, `data = 100` happens-before Thread B reads `data`.
+
+
+* **Result:** Thread B is guaranteed to see `100`, never the default `0`.
+
+---
+
+### 4. Essential Happens-Before Rules
+
+* **Program Order Rule:** Earlier actions in a single thread happen-before later actions in that same thread.
+* **Volatile Rule:** A write to a volatile variable happens-before every subsequent read of that same variable.
+* **Monitor Rule:** Unlocking a monitor (`synchronized`) happens-before every subsequent lock of that same monitor.
+* **Thread Start Rule:** Calling `thread.start()` happens-before any actions executed inside the started thread.
+* **Thread Join Rule:** All actions within a thread happen-before another thread successfully returns from `thread.join()`.
+
+---
+
+### 5. Happens-Before with `synchronized`
+
+* Exiting a `synchronized` method/block (releasing a monitor) **happens-before** another thread entering a `synchronized` block on the same monitor.
+* Guarantees both **mutual exclusion** (only one thread inside at a time) and **visibility** of all updates made prior to releasing the lock.
+
+---
+
+### 6. Visibility vs. Happens-Before
+
+* **Visibility Guarantee:** The *outcome*—a thread successfully sees another thread's updates.
+* **Happens-Before:** The *formal JMM mechanism/relationship* that enforces that ordering and visibility.
+* *Note:* Neither guarantees atomicity for compound statements like `count++`.
