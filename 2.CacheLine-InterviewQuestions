@@ -1,0 +1,587 @@
+=====================================================================
+JAVA MEMORY MODEL, VOLATILE, CPU CACHE, REORDERING, BARRIERS
+Interview Q&A (Modules 1 to 6)
+=====================================================================
+How to use: Answers are written the way you would SPEAK them in an
+interview (30-90 seconds). "Yaad rakho" lines are Hinglish memory
+hooks, not for saying aloud. "Senior line" = one extra sentence that
+lifts a good answer to a strong answer.
+
+
+=====================================================================
+PART 1: CPU CACHE AND CACHE LINES
+=====================================================================
+
+Q1. What is a cache line? What is its size?
+-------------------------------------------
+A cache line is the smallest unit of data that moves between main
+memory and the CPU caches. The CPU never fetches a single byte; it
+fetches a whole block. On most x86 and ARM server CPUs that block is
+64 bytes. (Some chips differ, for example Apple M-series uses 128
+bytes in parts of the hierarchy.)
+
+Why it matters: when you read one value, the neighbouring bytes come
+along for free. That gives us spatial locality, which is why
+sequential array access is fast. The flip side is false sharing.
+
+Yaad rakho: cache line = 64 BYTES (bits nahi). Ek line mein 16 ints
+ya 8 longs.
+
+Senior line: "Memory access cost is dominated by cache misses, so data
+layout often matters more than instruction count."
+
+
+Q2. What is false sharing? How do you detect and fix it?
+--------------------------------------------------------
+False sharing happens when two threads on different cores write to
+DIFFERENT variables that happen to sit on the SAME cache line. The
+variables are logically independent, but the hardware tracks
+ownership per line, not per variable. Each write forces the other
+core's copy of the line to be invalidated, so the line bounces
+between cores. Throughput can drop several times.
+
+Detection:
+ - Symptom: multi-threaded code does not scale with cores even
+   though threads touch separate data.
+ - Benchmark with JMH, with and without padding, and compare.
+ - On Linux, "perf c2c" reports cache lines with contended access.
+   Intel VTune also has memory-access analysis.
+
+Fixes:
+ - Padding: put unused fields between the hot variables so they land
+   on separate lines.
+ - @Contended (jdk.internal.vm.annotation.Contended). It pads
+   fields (128 bytes by default). Outside the JDK you need
+   -XX:-RestrictContended to enable it.
+ - Redesign: per-thread state, striping (what LongAdder does).
+
+Code:
+   class PaddedCounters {
+       volatile long a;
+       long p1, p2, p3, p4, p5, p6, p7;   // 56 bytes padding
+       volatile long b;
+   }
+Caveat: the JVM may reorder or strip fields, so @Contended is more
+reliable than hand-written padding.
+
+Senior line: "I would first prove it with a benchmark or perf c2c,
+because padding wastes memory and should only go on proven hot spots."
+
+
+Q3. Why is LongAdder faster than AtomicLong under high contention?
+------------------------------------------------------------------
+AtomicLong has one shared value. Every increment is a CAS on that
+single memory location, so under heavy contention threads keep
+failing CAS and retrying, and the cache line ping-pongs between
+cores.
+
+LongAdder (built on Striped64) keeps a base value plus an array of
+Cells. Contended threads hash to different cells and update them
+independently, and the cells are padded with @Contended so they do
+not false-share. sum() adds base plus all cells.
+
+Trade-off: sum() is not an atomic snapshot, so LongAdder is great
+for statistics and counters, but not when you need an exact value at
+a precise moment (for example, sequence generation or
+compare-and-set logic).
+
+Yaad rakho: ek jagah ka bheed -> kai cells mein bant diya, aur
+cells ko alag cache lines di.
+
+
+Q4. Which is faster to sum, int[] or Integer[], and why?
+---------------------------------------------------------
+int[] is faster, mainly because of cache behaviour.
+ - int[] stores values contiguously. One 64-byte cache line holds 16
+   ints, so after the first miss the next 15 reads are cache hits
+   (spatial locality), and the hardware prefetcher also helps.
+ - Integer[] stores only references contiguously. Each Integer
+   object lives somewhere on the heap, so every element needs an
+   extra pointer dereference ("pointer chasing") that is often a
+   cache miss going to RAM (about 100 ns vs about 1 ns for L1).
+ - Memory overhead: an Integer object has a header (about 12-16
+   bytes) plus the value, so a line holds far fewer values and more
+   lines must be fetched. There is also unboxing cost.
+
+Senior line: "That is why performance-critical code uses primitive
+arrays or primitive-specialised collections like fastutil or
+Eclipse Collections."
+
+Interviewer is checking: do you understand that performance depends
+on memory layout, not only algorithmic complexity.
+
+
+=====================================================================
+PART 2: CACHE COHERENCY (MESI)
+=====================================================================
+
+Q5. Explain the four MESI states.
+---------------------------------
+MESI is a cache coherence protocol. Each cache line in each core's
+cache is in one of four states:
+ - Modified: this core has the only valid copy and it differs from
+   RAM (dirty). Memory is stale.
+ - Exclusive: this core has the only copy and it matches RAM (clean).
+ - Shared: several cores may hold the line; all copies match RAM.
+ - Invalid: this core's copy is stale or absent and must be
+   re-fetched before use.
+
+Yaad rakho: M = maine likha, E = akela owner, S = sab padh rahe,
+I = copy bekaar.
+
+
+Q6. Core 2 writes a line that is Shared with Core 1. What happens?
+-------------------------------------------------------------------
+Core 2 must first get exclusive ownership. It broadcasts an
+invalidate (an "upgrade" or RFO, read-for-ownership, if it did not
+have the line). Core 1 snoops the message and marks its copy
+Invalid. Core 2's copy becomes Modified and it writes. If Core 1
+later reads, it gets a miss; Core 2 supplies the data (and memory is
+updated), and both end up Shared.
+
+This is write-invalidate: reading shared data is cheap, writing
+shared data is expensive.
+
+
+Q7. Explain false sharing using MESI.
+-------------------------------------
+Variables a and b share one line. Core 1 writes a: its line goes to
+Modified, Core 2's goes Invalid. Core 2 writes b: it must take the
+line, Core 1's goes Invalid, Core 2's goes Modified. Repeat. The
+line ping-pongs M <-> I between cores, and every write costs a
+cache miss plus bus traffic even though there is no real data
+sharing.
+
+
+Q8. Core 1 holds a line in Exclusive and writes it. Is a bus message
+sent?
+-------------------------------------------------------------------
+No. Exclusive means no other core has a copy, so there is nobody to
+invalidate. The core transitions E -> M silently. That is the whole
+point of the E state: it makes private writes cheap. A message only
+flows when another core reads (snooping): the owner supplies the
+data and both go to Shared.
+
+Term to use: snooping, each cache watches the bus for requests
+about lines it holds.
+
+
+Q9. Hardware is cache coherent, so why do we still need volatile?
+-----------------------------------------------------------------
+This is the most asked question in this area. Coherence and
+visibility ordering are different things.
+
+ - Coherence only guarantees that all cores eventually agree on the
+   value of a SINGLE memory location. It says nothing about the
+   ORDER in which writes to DIFFERENT locations become visible.
+ - Store buffers: a core puts a write in a store buffer first; it
+   reaches the cache later, so other cores see it late. Invalidate
+   queues delay the reader side too.
+ - CPU out-of-order execution can reorder independent instructions.
+ - The compiler/JIT can reorder, and can keep a variable in a
+   register or hoist a read out of a loop. Hardware coherence cannot
+   help here because the value never even reaches the cache.
+
+volatile fixes all of these: the JIT cannot cache or hoist it, and
+the barriers it emits stop reordering and flush stores.
+
+Senior line: "Coherence is about one address; the memory model is
+about ordering across addresses. volatile gives me the second."
+
+
+Q10. Write-invalidate vs write-update?
+--------------------------------------
+Write-invalidate: on a write, other copies are marked Invalid and
+re-fetched only if needed. Low bus traffic when the same core writes
+repeatedly. This is what modern CPUs use.
+Write-update: on a write, the new value is broadcast to all holders.
+Readers always have fresh data, but every write generates traffic,
+even for lines nobody will read again.
+
+
+=====================================================================
+PART 3: INSTRUCTION REORDERING
+=====================================================================
+
+Q11. What is instruction reordering, and who does it?
+-----------------------------------------------------
+The order in which operations actually execute or become visible can
+differ from the order in the source code. Three layers can do it:
+ 1. Compiler / JIT: reorders statements, eliminates redundant reads,
+    keeps values in registers, hoists loads out of loops.
+ 2. CPU out-of-order execution: runs whichever instructions are
+    ready, to avoid stalling.
+ 3. Memory system: store buffers and caches make a write visible to
+    other cores later than a subsequent read or write.
+It is allowed because it improves performance and, for a single
+thread, nobody can tell.
+
+
+Q12. What is as-if-serial semantics? Why is reordering safe in single
+thread but not in multi-thread?
+---------------------------------------------------------------------
+As-if-serial: the compiler and CPU may reorder anything as long as
+the result observable within a single thread is the same as
+sequential execution. Independent operations (no data dependency)
+can be swapped.
+
+In a single thread the program cannot observe the swap. In
+multi-thread code, another thread CAN observe the intermediate
+states. For example, "data = 42; ready = true;" has no dependency
+between the two lines, so they may be swapped, and a reader that
+sees ready == true might still see data == 0.
+
+Classic litmus test:
+   T1: x = 1; r1 = y;      T2: y = 1; r2 = x;
+Without reordering, (r1, r2) = (0, 0) is impossible. With
+reordering (each thread's load moves before its store, or the store
+sits in the store buffer), (0, 0) is possible.
+
+
+Q13. Why does a non-volatile flag loop sometimes never terminate?
+-----------------------------------------------------------------
+   boolean ready;   while (!ready) { }
+Without volatile or synchronization, there is no happens-before
+edge between the writer thread and this loop. The JIT is allowed to
+assume no other thread changes ready, so it can read it once, keep
+it in a register, and effectively compile the loop to
+while (true). Even without the JIT, the reader may keep seeing a
+stale cached value. Making the field volatile prevents hoisting and
+creates the happens-before edge.
+
+Practical: run it with and without volatile; the broken version
+typically hangs after the JIT compiles the loop (often needs the
+loop to be hot).
+
+
+Q14. Why is volatile needed in Double-Checked Locking?
+------------------------------------------------------
+   inst = new Singleton();
+is three steps: (1) allocate memory, (2) run the constructor,
+(3) assign the reference to inst. Steps 2 and 3 can be reordered. A
+second thread doing the unsynchronized first check "if (inst ==
+null)" may see a non-null reference to a partially constructed
+object and use it.
+
+Declaring the field volatile makes the write of the reference a
+release: everything done in the constructor happens-before any
+thread that reads the non-null reference. So it is about ORDERING
+(safe publication), not only visibility.
+
+Alternatives I prefer: the initialization-on-demand holder idiom
+(a static nested class, relies on class-init guarantees), or an
+enum singleton.
+
+
+=====================================================================
+PART 4: MEMORY BARRIERS
+=====================================================================
+
+Q15. What is a memory barrier? What types exist?
+------------------------------------------------
+A memory barrier (fence) is an instruction or compiler directive
+that prevents certain reorderings across it and forces the effects
+of earlier operations to become visible before later ones.
+Four conceptual types (first op, then second op):
+ - LoadLoad: loads before the barrier complete before loads after.
+ - LoadStore: loads before are ordered before stores after.
+ - StoreStore: stores before are visible before stores after.
+ - StoreLoad: stores before are visible before loads after.
+A full fence combines all four.
+
+
+Q16. Which barrier is the most expensive and why?
+-------------------------------------------------
+StoreLoad. To order an earlier store before a later load, the core
+must drain its store buffer (make all pending writes globally
+visible) while later loads wait. The other three are cheap or free
+on strongly ordered hardware.
+
+
+Q17. Which barriers are inserted for volatile reads and writes?
+---------------------------------------------------------------
+Conceptually (the conservative JSR-133 cookbook mapping):
+ - Volatile write: StoreStore (and LoadStore) barrier BEFORE the
+   write, StoreLoad barrier AFTER it. This is "release" behaviour:
+   all earlier writes become visible no later than the volatile
+   write.
+ - Volatile read: LoadLoad and LoadStore barriers AFTER the read.
+   This is "acquire" behaviour: later operations cannot move above
+   the read.
+The JIT may elide barriers it can prove unnecessary. On x86 only
+the StoreLoad part needs a real instruction (HotSpot emits
+lock addl $0,(%rsp) after the volatile store). On ARMv8 HotSpot
+uses ldar/stlr (acquire/release instructions) instead of separate
+barrier instructions.
+
+
+Q18. What is the difference between x86 and ARM here? Does "works on
+x86" mean the code is correct?
+--------------------------------------------------------------------
+x86 follows a strong model (Total Store Order): the only reordering
+the hardware does is Store->Load (via the store buffer). ARM and
+POWER have weak models: loads and stores can be reordered in many
+more ways, so more barriers are needed.
+
+So a data race can appear to work on x86 and fail on ARM (Apple
+silicon, AWS Graviton). Also, the JIT can reorder regardless of
+hardware. Correctness must come from the Java Memory Model rules
+(volatile, synchronized, final, etc.), never from observed behaviour
+on one CPU.
+
+
+Q19. What happens to normal writes made before a volatile write?
+----------------------------------------------------------------
+They are visible to any thread that subsequently reads that volatile
+variable and sees the written value. This works through
+happens-before: program order (the normal write happens-before the
+volatile write) plus the volatile rule (write happens-before the
+later read) plus transitivity. It is called "piggybacking" on
+volatile.
+
+   int data; volatile boolean ready;
+   T1: data = 42; ready = true;
+   T2: if (ready) print(data);   // guaranteed 42
+
+Note: making data volatile as well adds cost and no extra
+correctness here.
+
+
+=====================================================================
+PART 5: JAVA MEMORY MODEL AND HAPPENS-BEFORE
+=====================================================================
+
+Q20. What is the Java Memory Model and why do we need it?
+---------------------------------------------------------
+The JMM (JLS chapter 17, JSR-133) is a specification that defines
+what values a read may see and which reorderings are legal, for
+every JVM on every hardware. It lets programmers reason about
+concurrency without knowing CPU details. It covers three things:
+ - Atomicity: an operation is indivisible (single reads/writes of
+   most types, volatile, Atomic*, locks).
+ - Visibility: when one thread's writes become visible to another.
+ - Ordering: which instruction orders are guaranteed.
+The central tool is the happens-before relation.
+
+
+Q21. What is happens-before? List the main rules.
+-------------------------------------------------
+If action A happens-before action B, then the effects of A are
+visible to B and A is ordered before B. It is a guarantee about
+visibility and ordering, not a statement about wall-clock time.
+Rules:
+ 1. Program order: within one thread, each action happens-before
+    every later action in program order.
+ 2. Monitor lock: an unlock of monitor m happens-before every later
+    lock of the same m.
+ 3. Volatile: a write to a volatile variable happens-before every
+    later read of that same variable.
+ 4. Thread start: a call to Thread.start() happens-before any action
+    in the started thread.
+ 5. Thread termination/join: all actions in a thread happen-before
+    another thread successfully returns from join() on it (or sees
+    isAlive() == false).
+ 6. Transitivity: if A hb B and B hb C, then A hb C.
+Others: interrupt() happens-before the interrupted thread detects
+it; default values (0/null) are written before any action in a
+program; end of a constructor happens-before the start of the
+finalizer. java.util.concurrent adds more (for example, actions
+before submitting to an Executor, and before putting into a
+concurrent collection, happen-before the consuming action).
+
+
+Q22. How is happens-before different from "happened earlier in time"?
+----------------------------------------------------------------------
+Time order does not give visibility. If T1 writes at 10:00:00 and
+T2 reads at 10:00:05 with no synchronization between them, there is
+no happens-before edge, so T2 is NOT guaranteed to see the write.
+Conversely, happens-before does not require actual temporal order of
+execution; it is a logical guarantee. Visibility comes only from
+edges built with synchronization actions.
+
+
+Q23. What is a data race? How is it different from a race
+condition?
+----------------------------------------------------------
+Data race (JLS definition): two accesses to the same variable, at
+least one a write, not ordered by happens-before. The JMM gives very
+weak guarantees for racy programs (stale values, and for non-volatile
+long/double possibly torn values).
+
+Race condition: a logic bug where correctness depends on the timing
+of threads, for example check-then-act: "if (!map.containsKey(k))
+map.put(k, v)" with a thread-safe map still races logically.
+
+They are independent: you can have a race condition without a data
+race (every access is synchronized but the compound logic is not
+atomic) and a data race that happens to be harmless.
+
+
+Q24. Two threads synchronize on different monitors. Is that safe?
+-----------------------------------------------------------------
+No. A happens-before edge exists only between an unlock and a later
+lock of the SAME monitor object. Different locks give mutual
+exclusion for neither and create no visibility edge. Also, if only
+the writer synchronizes and the reader reads plainly, there is no
+edge either: both sides must use the same lock (or volatile).
+
+   Safe:    T1: synchronized(m){ x = 1; }  T2: synchronized(m){ r = x; }
+   Unsafe:  T1: synchronized(m){ x = 1; }  T2: r = x;   // data race
+
+
+Q25. What does the JMM guarantee for final fields?
+--------------------------------------------------
+If an object is constructed properly (the this reference does not
+escape during construction), then any thread that obtains a
+reference to it, even through a data race, is guaranteed to see the
+correct values of its final fields, and of objects reachable only
+through those final fields, as of the end of the constructor.
+Non-final fields get no such guarantee without safe publication.
+This is why immutable objects (all fields final) are inherently
+thread-safe to share.
+Pitfall: leaking this from a constructor (starting a thread,
+registering a listener) breaks the guarantee.
+
+
+Q26. What is safe publication? Ways to do it?
+---------------------------------------------
+Making an object reachable by other threads in a way that also
+makes its state fully visible. Safe ways:
+ - Initialize it in a static initializer.
+ - Store the reference in a volatile field or AtomicReference.
+ - Store it in a final field (of a properly constructed object).
+ - Store it in a field guarded by a lock (and read it under the same
+   lock).
+ - Hand it over via a thread-safe collection or queue
+   (ConcurrentHashMap, BlockingQueue) or an Executor.
+Unsafe: assigning to a plain non-volatile field and reading it from
+another thread.
+
+
+Q27. How do Thread.start() and join() provide visibility?
+----------------------------------------------------------
+Everything the parent thread did before calling start()
+happens-before everything the new thread does, so the child sees
+all earlier writes without extra synchronization. Everything a
+thread did happens-before the return of join() in the thread that
+joined it, so after join() the joiner sees all of its writes. These
+are two of the cheapest and most overlooked ways to share data
+safely (for example, fork work, join, then read results).
+
+
+=====================================================================
+PART 6: VOLATILE IN DEPTH
+=====================================================================
+
+Q28. What does volatile guarantee, and what does it not?
+--------------------------------------------------------
+Guarantees:
+ - Visibility: a read sees the latest write by any thread; the value
+   is not cached in a register or stale cache.
+ - Ordering: volatile accesses are not reordered with earlier or
+   later memory operations in the ways the JMM forbids, and writes
+   before a volatile write are visible after the matching read
+   (happens-before).
+ - Atomicity of the single read or write, including long and double
+   (which may otherwise be split into two 32-bit halves).
+Does NOT guarantee:
+ - Atomicity of compound operations (i++, check-then-act,
+   read-modify-write).
+ - Mutual exclusion.
+ - Anything about the contents behind a reference (see Q33).
+
+
+Q29. Is "volatile int count; count++" thread-safe?
+--------------------------------------------------
+No. count++ is read, add, write: three steps. Two threads can both
+read 0, both compute 1, both write 1, and one update is lost.
+Visibility is fine, atomicity is missing. Fix: AtomicInteger
+(incrementAndGet, which uses a CAS loop), LongAdder for heavy
+contention, or synchronized/lock when it must be combined with other
+state.
+
+
+Q30. volatile vs synchronized vs AtomicInteger: when to use which?
+------------------------------------------------------------------
+ - volatile: one variable, written by one thread (or writes that do
+   not depend on the old value), read by many. Flags, config
+   references, safe publication.
+ - Atomic* / LongAdder: lock-free atomic read-modify-write on a
+   single variable (counters, CAS state machines).
+ - synchronized / Lock: multiple variables that must change
+   together (invariants), compound actions, or when you need mutual
+   exclusion and blocking/waiting semantics.
+Cost view: volatile read is cheap, volatile write has a StoreLoad
+barrier, CAS costs a locked instruction and can retry under
+contention, locks can block and context switch.
+
+
+Q31. Is a plain (non-volatile) long read/write atomic?
+------------------------------------------------------
+The JLS (17.7) says a write to a non-volatile long or double may be
+treated as two separate 32-bit writes, so another thread could see a
+torn value (high half from one write, low half from another). In
+practice, 64-bit HotSpot JVMs do 64-bit atomic writes, but the
+specification does not guarantee it. Declare it volatile (or use
+AtomicLong) when it is shared. All other primitives (and
+references) are atomic for single reads/writes.
+
+
+Q32. How does volatile create happens-before?
+---------------------------------------------
+A write to a volatile variable happens-before every subsequent read
+of that same variable. Combined with program order and transitivity,
+anything the writing thread did before the volatile write is visible
+to a reading thread after it reads the volatile value. Mechanically
+this is implemented with the barriers from Q17.
+
+
+Q33. If I declare "volatile int[] arr", is arr[0] = 5 visible?
+--------------------------------------------------------------
+Not by itself. volatile applies to the reference variable arr, not
+to the array elements. Writing the element is a plain write. Options:
+use AtomicIntegerArray, VarHandle with volatile/acquire-release
+access modes on elements, or synchronize. A common safe pattern is
+to build a new array/immutable object and publish it by assigning
+to the volatile reference (copy-on-write). Writes done BEFORE the
+volatile assignment are visible after reading the reference.
+
+
+Q34. Two threads run: if (!flag) { flag = true; doWork(); } with a
+volatile boolean flag. Does doWork() run only once?
+-------------------------------------------------------------------
+No, it can run twice. This is a check-then-act race: both threads
+can read flag == false before either writes true. volatile gives
+visibility, not atomic check-and-set. Fix with
+AtomicBoolean.compareAndSet(false, true), which does the check and
+the set as one atomic step, or use a lock.
+
+
+=====================================================================
+RAPID-FIRE CHEAT SHEET (revise 10 minutes before the interview)
+=====================================================================
+ - Cache line = 64 bytes. Same line + different threads writing =
+   false sharing. Fix: @Contended / padding / striping.
+ - int[] fast, Integer[] slow: contiguous values vs pointer chasing.
+ - MESI: M modified, E exclusive, S shared, I invalid. Write needs
+   ownership, others go Invalid. E -> M is silent.
+ - Coherence = one address agrees. Memory model = ordering across
+   addresses. That is why volatile exists on coherent hardware.
+ - Reordering by: compiler/JIT, CPU out-of-order, store buffer.
+   Allowed if single-thread result is same (as-if-serial).
+ - Barriers: LoadLoad, LoadStore, StoreStore, StoreLoad (costliest).
+   Volatile write = release, volatile read = acquire.
+ - x86 hides bugs (only Store->Load reorders). ARM exposes them.
+ - JMM = rulebook. happens-before = visibility + ordering, not time.
+ - HB rules: program order, monitor lock, volatile, start, join,
+   transitivity.
+ - Data race = conflicting access with no HB edge.
+ - volatile = visibility + ordering + single read/write atomicity.
+   NOT count++, NOT check-then-act.
+ - DCL needs volatile because of reordering (publish before
+   construct).
+ - Same lock object on BOTH reader and writer, or no guarantee.
+
+NOTE: The mock-interview opening question (running flag) is
+deliberately not answered here, so you can attempt it fresh.
+=====================================================================
